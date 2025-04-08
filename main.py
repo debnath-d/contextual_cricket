@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+def new_function():
+    pass
 
 def get_matches_index_from_year_data(data_dir: Path):
     data = []
@@ -199,8 +201,9 @@ def analyze_data(data_dir: Path):
 
 def main():
     paths = [
-        Path("/", "home", "debnath", "Files", "cricsheet.org", "t20s_male_json"),
+        Path("/", "home", "om", "Files", "cricsheet.org", "t20s_male_json"),
         Path("/", "storage2", "Files", "cricsheet.org", "t20s_male_json"),
+        Path("/","home","om","Downloads","t20s_male_json"),
     ]
     for path in paths:
         if path.exists():
@@ -209,7 +212,8 @@ def main():
     else:
         print("No valid data directory found.")
         return
-
+    
+    # return
     # construct_dataframes(
     #     data_dir=data_dir,
     #     save_dir=data_dir.parent / "data",
