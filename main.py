@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-def new_function():
-    pass
+np.set_printoptions(precision=3, suppress=True)
+
 
 def get_matches_index_from_year_data(data_dir: Path):
     data = []
@@ -119,82 +119,77 @@ def construct_dataframes(data_dir: Path, save_dir: Path = None):
         df.drop(columns=cols).to_feather(save_dir / "data.feather")
 
 
-def analyze_batsmen(df: pd.DataFrame, runs_col: str):
-    return (
-        pd.concat(
-            [
-                df.pivot_table(
-                    index="batter",
-                    # index=["batter", "bowler"],
-                    values=runs_col,
-                    aggfunc={runs_col: ["sum", "count", "mean"]},
-                ),
-                df.value_counts("player_out").rename("out"),
-            ],
-            axis="columns",
+def normalize_runs(df: pd.DataFrame, runs_col: str):
+    mean_std = (
+        df.pivot_table(
+            index="match_id",
+            values=runs_col,
+            aggfunc={runs_col: ["mean", "std"]},
         )
-        .dropna()
-        .sort_values("count", ascending=False)
+        .reindex(df["match_id"])
+        .set_axis(df.index)
     )
+    norm_runs = (df[runs_col] - mean_std["mean"]) / mean_std["std"]
+    return norm_runs
+
+
+def calculate_weights(df: pd.DataFrame, index: pd.DataFrame):
+    discount_factor = 0.999
+    dates = index["date"].drop_duplicates().rename(None)
+    k = (dates.iloc[0] - dates).dt.days.to_numpy().reshape(-1, 1)
+
+    mask = np.triu(np.ones((len(dates), len(dates)), dtype=bool))
+
+    weights = pd.DataFrame(
+        discount_factor**k * mask,
+        index=dates,
+        columns=dates,
+    )
+
+    return weights.reindex(index["date"]).set_axis(index["id"])
+
+
+def analyze_batsmen(df: pd.DataFrame, runs_col: str, weights: pd.DataFrame = None):
+    if weights is None:
+        weights = pd.Series(1, index=df.match_id.drop_duplicates())
+
+    runs = df.pivot_table(
+        columns="match_id",
+        index="batter",
+        values=runs_col,
+        aggfunc={runs_col: ["sum", "count"]},
+        fill_value=0,
+    )
+    wickets = df.pivot_table(
+        columns="match_id",
+        index="player_out",
+        aggfunc={"player_out": "count"},
+        fill_value=0,
+    )["player_out"]
+    wickets[weights.index.difference(wickets.columns)] = 0
+
+    runs_weighted = runs["sum"] @ weights
+    balls_weighted = runs["count"] @ weights
+    wickets_weighted = wickets @ weights
+    average = runs_weighted / wickets_weighted
+    strike_rate = runs_weighted / balls_weighted
+
+    return average, strike_rate
 
 
 def analyze_data(data_dir: Path):
     df = pd.read_feather(data_dir / "data.feather")
     index = pd.read_feather(data_dir / "index.feather")
     registry = pd.read_feather(data_dir / "player_registry.feather")["player"]
-    # for col in ["batter", "bowler", "non_striker", "player_out", "fielder"]:
-    #     df[col] = registry.reindex(df[col]).to_numpy()
-    mean_std = (
-        df.pivot_table(
-            index="match_id",
-            values="runs.total",
-            aggfunc={"runs.total": ["mean", "std"]},
-        )
-        .reindex(df["match_id"])
-        .set_axis(df.index)
-    )
-    runs = (df["runs.total"] - mean_std["mean"]) / mean_std["std"]
-    df["runs.norm"] = runs.set_axis(df.index)
 
-    # batsmen = batsmen.reindex(
-    #     batsmen[["count", "mean"]]
-    #     .rank(pct=True)
-    #     .prod(axis=1)
-    #     .sort_values(ascending=False)
-    #     .index
-    # )
-    # .head(100)
-    # .sort_values("mean", ascending=False)
-    batsmen = analyze_batsmen(df, "runs.norm")
-    batsmen["avg"] = batsmen["sum"] / batsmen["out"]
-    batsmen.index = batsmen.index.map(registry)
-    batsmen[lambda df: df["out"].rank(pct=True) > 0.95].sort_values(
-        "avg", ascending=False
-    ).head(15)
-    k: pd.Series = (index["date"].iloc[0] - index["date"]).dt.days.set_axis(index["id"])
-    discount_factor = 0.999
-    weights = discount_factor**k
-    # weights = pd.Series(1, index=index["id"])
-    df["weights"] = weights.reindex(df["match_id"]).set_axis(df.index)
-    df["runs.weighted"] = df["runs.norm"] * df["weights"]
-    batsmen = df.pivot_table(
-        index="batter",
-        # index=["batter", "bowler"],
-        # values="runs.weighted",
-        aggfunc={
-            "runs.weighted": "sum",
-            "weights": "sum",
-        },
-    )
-    batsmen["strike_rate"] = batsmen["runs.weighted"] / batsmen["weights"]
-    batsmen.index = batsmen.index.map(registry)
-    rank = batsmen.rank(pct=True)
-    batsmen[(rank["weights"] > 0.90) & (rank["strike_rate"] > 0.90)].sort_values(
-        # "runs.weighted",
-        # "weights",
-        "strike_rate",
-        ascending=False,
-    ).head(30)
+    df["runs.norm"] = normalize_runs(df=df, runs_col="runs.total")
+    weights = calculate_weights(df=df, index=index)
+    avg, sr = analyze_batsmen(df, runs_col="runs.norm", weights=weights)
+    avg.index = avg.index.map(registry)
+    sr.index = sr.index.map(registry)
+
+    print(avg.loc["V Kohli"]["2022"])
+    print(sr.loc["V Kohli"]["2022"])
 
     return
 
@@ -221,13 +216,5 @@ def main():
     analyze_data(data_dir=data_dir.parent / "data")
 
 
-def temp():
-    scores = pd.read_csv(
-        "/home/debnath/Documents/IIITH/sem_6/SMAI/Project/SMAI Project Evaluation and Discussion Slots - Evaluation.csv"
-    )
-    print(scores)
-
-
 if __name__ == "__main__":
-    # temp()
     main()
