@@ -66,7 +66,7 @@ def construct_dataframes(data_dir: Path, save_dir: Path = None):
     index = get_matches_index(data_dir=data_dir)
     player_registry = pd.Series([])
     {}.get("id")
-    print(index.head())
+    # print(index.head())
     data = []
     for match_id in tqdm(index["id"].to_numpy()):
         overs_data = []
@@ -160,6 +160,7 @@ def analyze_batsmen(df: pd.DataFrame, runs_col: str, weights: pd.DataFrame = Non
         aggfunc={runs_col: ["sum", "count"]},
         fill_value=0,
     )
+    print(runs.head())
     wickets = df.pivot_table(
         columns="match_id",
         index="player_out",
@@ -190,14 +191,118 @@ def analyze_data(data_dir: Path):
 
     print(avg.loc["V Kohli"]["2022"])
     print(sr.loc["V Kohli"]["2022"])
+    print(list(df.columns))
 
+# Analyze bowlers
+    # Convert weights DataFrame to a Series by summing across dates for overall metrics
+    overall_weights = weights.sum(axis=1)
+    bowler_stats = analyze_bowlers(df, weights=overall_weights)
+    bowler_stats.index = bowler_stats.index.map(registry)
+    # print(bowler_stats.loc["Jasprit Bumrah"])  # Example: print stats for a specific bowler
+    
     return
 
+# def analyze_bowlers(df: pd.DataFrame, weights: pd.Series = None):
+#     print("Analyzing bowlers")
+#     if weights is None:
+#         weights = pd.Series(1, index=df.match_id.drop_duplicates())
 
+#     runs_bowler = df.pivot_table(
+#         columns="match_id",
+#         index="bowler",
+#         values="runs.total",
+#         aggfunc={"runs.total": ["sum", "count"]},
+#         fill_value=0,
+#     )
+#     print(runs_bowler.columns)
+#     wickets_bolwer = df[df["player_out"].notna()].pivot_table(
+#         columns="match_id",
+#         index="bowler",
+#         aggfunc={"player_out": "count"},
+#         fill_value=0,
+#     )
+#     # Ensure all match columns exist
+#     # for match in weights.index.difference(wickets.columns):
+#         # wickets[match] = 0
+
+#     runs_weighted = runs_bowler["sum"] @ weights
+#     balls_weighted = runs_bowler["count"] @ weights
+#     wickets_weighted = wickets_bolwer @ weights
+
+#     average = runs_weighted / wickets_weighted.replace(0, np.nan)
+#     strike_rate = balls_weighted / wickets_weighted.replace(0, np.nan)
+#     economy = runs_weighted / (balls_weighted / 6)
+
+#     print("Bowler weighted metrics calculated.")
+#     return wickets_weighted, average, strike_rate, economy
+
+
+def analyze_bowlers(df: pd.DataFrame, weights: pd.Series = None):
+    if weights is None:
+        weights = pd.Series(1, index=df['match_id'].unique())
+
+    # Identify legal deliveries and wickets credited to the bowler
+    df['is_legal'] = (df['extras.wides'].isna()) & (df['extras.noballs'].isna())
+    df['is_wicket'] = df['dismissal_type'].notna() & (df['dismissal_type'] != 'run out')
+
+    runs_conceded = df.pivot_table(
+        columns="match_id",
+        index="bowler",
+        values="runs.total",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    legal_balls = df.pivot_table(
+        columns="match_id",
+        index="bowler",
+        values="is_legal",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    wickets_taken = df.pivot_table(
+        columns="match_id",
+        index="bowler",
+        values="is_wicket",
+        aggfunc="sum",
+        fill_value=0,
+    )
+
+    # Ensure all match_ids from weights are included
+    all_match_ids = weights.index
+    runs_conceded = runs_conceded.reindex(columns=all_match_ids, fill_value=0)
+    legal_balls = legal_balls.reindex(columns=all_match_ids, fill_value=0)
+    wickets_taken = wickets_taken.reindex(columns=all_match_ids, fill_value=0)
+
+    # Compute weighted sums
+    runs_conceded_weighted = runs_conceded @ weights
+    legal_balls_weighted = legal_balls @ weights
+    wickets_weighted = wickets_taken @ weights
+
+    # Calculate bowling metrics
+    bowling_average = runs_conceded_weighted / wickets_weighted
+    bowling_average[wickets_weighted == 0] = np.nan
+
+    economy_rate = runs_conceded_weighted / (legal_balls_weighted / 6)
+    economy_rate[legal_balls_weighted == 0] = np.nan
+
+    strike_rate = legal_balls_weighted / wickets_weighted
+    strike_rate[wickets_weighted == 0] = np.nan
+
+    total_wickets = wickets_weighted
+
+    result = pd.DataFrame({
+        'bowling_average': bowling_average,
+        'economy_rate': economy_rate,
+        'strike_rate': strike_rate,
+        'total_wickets': total_wickets,
+    })
+
+    return result
 def main():
     paths = [
-        Path("/", "home", "debnath", "Files", "cricsheet.org", "t20s_male_json"),
-        Path("/", "storage2", "Files", "cricsheet.org", "t20s_male_json"),
+        # Path("/", "home", "om", "Files", "cricsheet.org", "t20s_male_json"),
+        # Path("/", "storage2", "Files", "cricsheet.org", "t20s_male_json"),
+        Path("/","home","om","Downloads","t20s_male_json"),
     ]
     for path in paths:
         if path.exists():
