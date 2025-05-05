@@ -4,7 +4,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+from xgboost import XGBRegressor
 
 np.set_printoptions(precision=3, suppress=True)
 
@@ -146,24 +149,17 @@ def update_mean_std(mean: pd.Series, std: pd.Series, N: pd.Series, K: pd.Series)
     """
     Compute new mean and standard deviation after adding K zeroes to a dataset.
 
-    Parameters:
-    mean : pandas Series or numpy array
-        Original mean of the dataset
-    std : pandas Series or numpy array
-        Original standard deviation of the dataset
-    N : pandas Series or numpy array
-        Number of original data points
-    K : pandas Series or numpy array
-        Number of zeroes to add
+    mean : Original mean of the dataset
+    std : Original standard deviation of the dataset
+    N : Number of original data points
+    K : Number of zeroes to add
 
     Returns:
-    new_mean : numpy array
-        New mean after adding zeroes
-    new_std : numpy array
-        New standard deviation after adding zeroes
+    new_mean : New mean after adding zeroes
+    new_std : New standard deviation after adding zeroes
     """
     # Compute K/N ratio
-    r = K / N
+    r = K.divide(N, fill_value=0)
 
     # New mean: mu' = mu / (1 + K/N)
     new_mean = mean / (1 + r)
@@ -193,35 +189,35 @@ def normalize_runs(df: pd.DataFrame, runs_col: str, overs: pd.Series):
     ).swaplevel(axis="columns")
     first_innings, second_innings = x[0], x[1]
     not_all_out = first_innings["player_out"] < 10
-    less_than_20 = first_innings["over"] < 19
+    # less_than_20 = first_innings["over"] < 19
     # total_overs = 1 + (
     #     first_innings.loc[less_than_20 & not_all_out, "over"]
     #     .reindex_like(x)
     #     .fillna(19)
     #     .astype(int)
     # )
-    missing = overs.isna()
-    print(overs[missing])
-
-    # fmt: off
-    overs[missing] = [20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
-    # fmt: on
 
     chase_lose = x[1, "runs.total"] < x[0, "runs.total"]
-    balls_remaining = (
+    balls_remaining: pd.Series = (
         6 * (overs[~not_all_out] - first_innings.loc[~not_all_out, "over"])
         - first_innings.loc[~not_all_out, "ball_legit"]
     )
-    balls_remaining = (
+    balls_remaining = balls_remaining.add(
         6 * (overs[chase_lose] - second_innings.loc[chase_lose, "over"])
-        - second_innings.loc[chase_lose, "ball_legit"]
+        - second_innings.loc[chase_lose, "ball_legit"],
+        fill_value=0,
     )
-    norm_runs = (df[runs_col] - mean_std["mean"]) / mean_std["std"]
+    mean, std = update_mean_std(
+        mean=mean_std["mean"],
+        std=mean_std["std"],
+        N=mean_std["count"],
+        K=balls_remaining,
+    )
+    norm_runs = (df[runs_col] - df["match_id"].map(mean)) / df["match_id"].map(std)
     return norm_runs
 
 
-def calculate_weights(df: pd.DataFrame, index: pd.DataFrame):
-    discount_factor = 0.999
+def calculate_weights(index: pd.DataFrame, discount_factor: float):
     dates = index["date"].drop_duplicates().rename(None)
     k = (dates.iloc[0] - dates).dt.days.to_numpy().reshape(-1, 1)
 
@@ -238,7 +234,7 @@ def calculate_weights(df: pd.DataFrame, index: pd.DataFrame):
 
 def analyze_batsmen(df: pd.DataFrame, runs_col: str, weights: pd.DataFrame = None):
     if weights is None:
-        weights = pd.Series(1, index=df.match_id.drop_duplicates())
+        weights = pd.Series(1, index=df["match_id"].unique())
 
     runs = df.pivot_table(
         columns="match_id",
@@ -261,70 +257,77 @@ def analyze_batsmen(df: pd.DataFrame, runs_col: str, weights: pd.DataFrame = Non
     average = runs_weighted / wickets_weighted
     strike_rate = runs_weighted / balls_weighted
 
-    return average, strike_rate
+    return {
+        "avg": average,
+        "sr": strike_rate,
+    }
 
 
-def analyze_bowlers(df: pd.DataFrame, weights: pd.Series = None):
+def analyze_bowlers(df: pd.DataFrame, runs_col: str, weights: pd.Series = None):
     if weights is None:
         weights = pd.Series(1, index=df["match_id"].unique())
 
-    # Identify legal deliveries and wickets credited to the bowler
-    df["is_legal"] = (df["extras.wides"].isna()) & (df["extras.noballs"].isna())
-    df["is_wicket"] = df["dismissal_type"].notna() & (df["dismissal_type"] != "run out")
-
-    runs_conceded = df.pivot_table(
+    agg = df.pivot_table(
         columns="match_id",
         index="bowler",
-        values="runs.total",
+        values=[runs_col, "is_legal", "batsman_dismissed"],
         aggfunc="sum",
         fill_value=0,
     )
-
-    legal_balls = df.pivot_table(
-        columns="match_id",
-        index="bowler",
-        values="is_legal",
-        aggfunc="sum",
-        fill_value=0,
-    )
-
-    wickets_taken = df.pivot_table(
-        columns="match_id",
-        index="bowler",
-        values="is_wicket",
-        aggfunc="sum",
-        fill_value=0,
-    )
-
-    # Ensure all match_ids from weights are included
-
-    all_match_ids = weights.index
-    runs_conceded = runs_conceded.reindex(columns=all_match_ids, fill_value=0)
-    legal_balls = legal_balls.reindex(columns=all_match_ids, fill_value=0)
-    wickets_taken = wickets_taken.reindex(columns=all_match_ids, fill_value=0)
 
     # Compute weighted sums
-    runs_conceded_weighted = runs_conceded @ weights
-    legal_balls_weighted = legal_balls @ weights
-    wickets_weighted = wickets_taken @ weights
+    runs_weighted = agg[runs_col] @ weights
+    balls_weighted = agg["is_legal"] @ weights
+    wickets_weighted = agg["batsman_dismissed"] @ weights
 
     # Calculate bowling metrics
-    bowling_average = runs_conceded_weighted / wickets_weighted
-    bowling_average[wickets_weighted == 0] = np.nan
-    economy_rate = runs_conceded_weighted / (legal_balls_weighted / 6)
-    economy_rate[legal_balls_weighted == 0] = np.nan
-    strike_rate = legal_balls_weighted / wickets_weighted
-    strike_rate[wickets_weighted == 0] = np.nan
-    total_wickets = wickets_weighted
+    bowling_average = runs_weighted / wickets_weighted
+    # bowling_average[wickets_weighted == 0] = np.nan
+    economy = runs_weighted / balls_weighted
+    # economy[balls_weighted == 0] = np.nan
+    strike_rate = balls_weighted / wickets_weighted
+    # strike_rate[wickets_weighted == 0] = np.nan
 
-    result = pd.DataFrame(
-        {
-            "bowling_average": bowling_average,
-            "economy_rate": economy_rate,
-            "strike_rate": strike_rate,
-            "total_wickets": total_wickets,
-        }
+    # TODO experience = total balls played
+
+    return {
+        "avg": bowling_average,
+        "eco": economy,
+        "sr": strike_rate,
+    }
+
+
+def analyze_batsmen_bowlers(df: pd.DataFrame, runs_col: str, weights: pd.Series = None):
+    if weights is None:
+        weights = pd.Series(1, index=df["match_id"].unique())
+    agg = df.pivot_table(
+        # columns="match_id",
+        index=["batter", "bowler", "match_id"],
+        # aggfunc={
+        #     runs_col: ["sum", "count"],
+        #     "batsman_dismissed": "sum",
+        # },
+        values=[runs_col, "is_legal", "batsman_dismissed"],
+        aggfunc="sum",
     )
+    runs = agg[runs_col]
+    return {runs_col: runs}
+
+    agg = agg.unstack(fill_value=0)
+
+    runs_weighted = agg[runs_col] @ weights
+    balls_weighted = agg["is_legal"] @ weights
+    wickets_weighted = agg["batsman_dismissed"] @ weights
+    batting_strike_rate = runs_weighted / balls_weighted  # bowler's economy rate
+    average = runs_weighted / wickets_weighted
+    bowling_strike_rate = balls_weighted / wickets_weighted
+
+    return {
+        runs_col: runs,
+        "bat_sr": batting_strike_rate,
+        "avg": average,
+        "bowl_sr": bowling_strike_rate,
+    }
 
 
 def filter_data(df: pd.DataFrame, index: pd.DataFrame):
@@ -340,7 +343,34 @@ def filter_data(df: pd.DataFrame, index: pd.DataFrame):
     index = index[~condition].drop(columns="method").reset_index(drop=True)
     df = df[~df["match_id"].isin(remove_ids)]
     df = df[df["innings"] < 2].reset_index(drop=True)
+
+    index = index.iloc[: len(index) // 5]  # TODO remove this line
+    df = df[df["match_id"].isin(index["id"])]  # TODO remove this line
+
     return df, index
+
+
+def create_dataset(stats: dict, index: pd.DataFrame, target_col: str):
+    df: pd.DataFrame = stats["matchup"][target_col].reset_index()
+    df["date"] = df["match_id"].map(index["date"].set_axis(index["id"]))
+    dates = index["date"].drop_duplicates().sort_values().reset_index(drop=True)
+    dates.index = dates
+    df["prev_date"] = df["date"].map(dates.shift(1))
+    for stat_type, stat in stats.items():
+        for key, val in stat.items():
+            if key == target_col:
+                continue
+            cols = ["batter", "bowler"] if stat_type == "matchup" else [stat_type]
+            df[f"{stat_type}_{key}"] = pd.Index(df[cols + ["prev_date"]]).map(
+                val.stack()
+            )
+    df = (
+        df.drop(columns=["date", "prev_date"])
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    df[["batter", "bowler"]] = df[["batter", "bowler"]].astype("category")
+    return df.drop(columns=target_col), df[target_col]
 
 
 def analyze_data(data_dir: Path):
@@ -350,18 +380,65 @@ def analyze_data(data_dir: Path):
 
     df, index = filter_data(df=df, index=index)
 
-    df["runs.norm"] = normalize_runs(
-        df=df,
-        runs_col="runs.total",
-        overs=index["overs"].set_axis(index["id"]).sort_index(),
+    if True:
+        df["runs.norm"] = normalize_runs(
+            df=df,
+            runs_col="runs.total",
+            overs=index["overs"].set_axis(index["id"]).fillna(20).sort_index(),
+        )
+        runs_col = "runs.norm"
+    else:
+        runs_col = "runs.total"
+    # Identify legal deliveries and wickets credited to the bowler
+    df["is_legal"] = df["extras.wides"].isna() & df["extras.noballs"].isna()
+    df["batsman_dismissed"] = df["dismissal_type"].isin(
+        [
+            "caught",
+            "bowled",
+            "lbw",
+            "stumped",
+            "caught and bowled",
+            "hit wicket",
+        ]
     )
-    weights = calculate_weights(df=df, index=index)
-    avg, sr = analyze_batsmen(df, runs_col="runs.norm", weights=weights)
-    avg.index = avg.index.map(registry)
-    sr.index = sr.index.map(registry)
+    weights = calculate_weights(index=index, discount_factor=0.999)
+    stats = {}
 
-    print(avg.loc["V Kohli"]["2022"])
-    print(sr.loc["V Kohli"]["2022"])
+    stats["bowler"] = analyze_bowlers(df=df, runs_col=runs_col, weights=weights)
+    stats["batter"] = analyze_batsmen(df, runs_col=runs_col, weights=weights)
+    stats["matchup"] = analyze_batsmen_bowlers(
+        df=df, runs_col=runs_col, weights=weights
+    )
+    X, y = create_dataset(stats=stats, index=index, target_col=runs_col)
+    train_id, test_id = train_test_split(index["id"], test_size=0.2, random_state=42)
+    X_train = X[X["match_id"].isin(train_id)]
+    X_test = X[X["match_id"].isin(test_id)]
+    y_train = y[X["match_id"].isin(train_id)]
+    y_test = y[X["match_id"].isin(test_id)]
+    print(X_train.shape, X_test.shape, y_train.shape, y_test.shape)
+
+    model_reg = XGBRegressor(
+        enable_categorical=True,
+        # subsample=0.7,
+        # evaluation_metric=mean_squared_error,
+    )
+    model_reg.fit(X_train, y_train)
+
+    # Evaluate
+    y_pred_train = model_reg.predict(X_train)
+    mse = mean_squared_error(y_train, y_pred_train)
+    print(f"Regression MSE (train): {mse:.4f}")
+
+    y_pred_test = model_reg.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred_test)
+    print(f"Regression MSE (test): {mse:.4f}")
+
+    # avg, sr = stats["bat"]["avg"], stats["bat"]["sr"]
+    # avg.index = avg.index.map(registry)
+    # sr.index = sr.index.map(registry)
+
+    # print(avg.loc["V Kohli"]["2022"])
+    # print(sr.loc["V Kohli"]["2022"])
 
     return
 
